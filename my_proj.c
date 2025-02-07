@@ -70,6 +70,7 @@ typedef struct {
 typedef struct {
     SemaphoreHandle_t xUnitsCountingSemaphore;
     QueueHandle_t eventQueue;
+    QueueHandle_t faultManagementQueue;
 } UnitParams_t;
 
 typedef struct {
@@ -90,6 +91,7 @@ QueueHandle_t fireDepartmentQueue = NULL;
 QueueHandle_t policeUnitsQueue = NULL;
 QueueHandle_t ambulanceUnitsQueue = NULL;
 QueueHandle_t fireUnitsQueue = NULL;
+QueueHandle_t faultManagementQueue = NULL;
 
 SemaphoreHandle_t xPoliceUnitsCountingSemaphore = NULL;
 SemaphoreHandle_t xAmbulanceUnitsCountingSemaphore = NULL;
@@ -254,6 +256,7 @@ void vEmergencyDespatcherTask(void *pvParameters) {
     DepartmentParams_t *policeParams = (DepartmentParams_t *)pvPortMalloc(sizeof(DepartmentParams_t));
     DepartmentParams_t *ambulanceParams = (DepartmentParams_t *)pvPortMalloc(sizeof(DepartmentParams_t));
     DepartmentParams_t *fireParams = (DepartmentParams_t *)pvPortMalloc(sizeof(DepartmentParams_t));
+    faultManagementQueue = xQueueCreate(10, REQUEST_QUEUE_ITEM_SIZE);
     policeDepartmentQueue = xQueueCreate(1, REQUEST_QUEUE_ITEM_SIZE);
     ambulanceDepartmentQueue = xQueueCreate(1, REQUEST_QUEUE_ITEM_SIZE);
     fireDepartmentQueue = xQueueCreate(1, REQUEST_QUEUE_ITEM_SIZE);
@@ -299,6 +302,7 @@ void vEmergencyDespatcherTask(void *pvParameters) {
     fireParams->auxUnitQueue[1] = ambulanceUnitsQueue;
     fireParams->xAuxUnitsCountingSemaphore[1] = xAmbulanceUnitsCountingSemaphore;
 
+    xTaskCreate(vFaultManagementTask, "FaultManagementTask", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 3, NULL);
     xTaskCreate(vDepartmentTask, "PoliceDepartmentTask", configMINIMAL_STACK_SIZE, (void*)policeParams, tskIDLE_PRIORITY + 2, NULL);
     xTaskCreate(vDepartmentTask, "AmbulanceDepartmentTask", configMINIMAL_STACK_SIZE, (void*)ambulanceParams, tskIDLE_PRIORITY + 2, NULL);
     xTaskCreate(vDepartmentTask, "FireDepartmentTask", configMINIMAL_STACK_SIZE, (void*)fireParams, tskIDLE_PRIORITY + 2, NULL);
@@ -389,6 +393,7 @@ void vUnitTask(void *pvParameters)
             int responseTime = 5000 + rand() % 50000;
             if(message.timeLimit < xTaskGetTickCount() + pdMS_TO_TICKS(responseTime)) {
                 logMsgSend(logQueue, LOG_WARNING, pcTaskGetName(NULL), "Dropping - the event won't be completed in time");
+                xQueueSend(faultManagementQueue, &message, 0);
             } else {
                 vTaskDelay(pdMS_TO_TICKS(responseTime));
                 if(message.responseQueue == NULL) {
@@ -411,54 +416,83 @@ void vUnitTask(void *pvParameters)
 void vEventDaemonTask(void *pvParameters)
 {
     EventDaemonParams_t *params = (EventDaemonParams_t *)pvParameters;
-    
     char logMsg[256];
 
-    if(xSemaphoreTake(params->xUnitsCountingSemaphore, 0) == pdPASS)
+    if(params)
     {
-        if(xQueueSend(params->unitQueue, &params->message, 0) != pdPASS) {
-            logMsgSend(logQueue, LOG_ERROR, pcTaskGetName(NULL), "Failed to send the message to the original unit");
-            xSemaphoreGive(params->xUnitsCountingSemaphore);
-        }
-    }
-    else if(xSemaphoreTake(params->xAuxUnitsCountingSemaphore[0], 0) == pdPASS)
-    {
-        if(xQueueSend(params->auxUnitQueue[0], &params->message, 0) != pdPASS) {
-            sprintf(logMsg, "Failed to send the message to the spare unit %s", params->auxUnitName[0]);
-            logMsgSend(logQueue, LOG_ERROR, pcTaskGetName(NULL), logMsg);
-            xSemaphoreGive(params->xAuxUnitsCountingSemaphore[0]);
-        }
-        else
+        if(xSemaphoreTake(params->xUnitsCountingSemaphore, 0) == pdPASS)
         {
-            sprintf(logMsg, "Sent the message to the spare unit %s", params->auxUnitName[0]);
-            logMsgSend(logQueue, LOG_INFO, pcTaskGetName(NULL), logMsg);
+            if(xQueueSend(params->unitQueue, &params->message, 0) != pdPASS) {
+                logMsgSend(logQueue, LOG_ERROR, pcTaskGetName(NULL), "Failed to send the message to the original unit");
+                xSemaphoreGive(params->xUnitsCountingSemaphore);
+                xQueueSend(faultManagementQueue, &params->message, 0);
+            }
         }
-    }
-    else if(xSemaphoreTake(params->xAuxUnitsCountingSemaphore[1], 0) == pdPASS)
-    {
-        if(xQueueSend(params->auxUnitQueue[1], &params->message, 0) != pdPASS) {
-            sprintf(logMsg, "Failed to send the message to the spare unit %s", params->auxUnitName[1]);
-            logMsgSend(logQueue, LOG_ERROR, pcTaskGetName(NULL), logMsg);
-            xSemaphoreGive(params->xAuxUnitsCountingSemaphore[1]);
-        }
-        else
+        else if(xSemaphoreTake(params->xAuxUnitsCountingSemaphore[0], 0) == pdPASS)
         {
-            sprintf(logMsg, "Sent the message to the spare unit %s", params->auxUnitName[1]);
-            logMsgSend(logQueue, LOG_INFO, pcTaskGetName(NULL), logMsg);
+            if(xQueueSend(params->auxUnitQueue[0], &params->message, 0) != pdPASS) {
+                sprintf(logMsg, "Failed to send the message to the spare unit %s", params->auxUnitName[0]);
+                logMsgSend(logQueue, LOG_ERROR, pcTaskGetName(NULL), logMsg);
+                xSemaphoreGive(params->xAuxUnitsCountingSemaphore[0]);
+                xQueueSend(faultManagementQueue, &params->message, 0);
+            }
+            else
+            {
+                sprintf(logMsg, "Sent the message to the spare unit %s", params->auxUnitName[0]);
+                logMsgSend(logQueue, LOG_INFO, pcTaskGetName(NULL), logMsg);
+                xQueueSend(faultManagementQueue, &params->message, 0);
+            }
         }
-    }
-    else if(params->message.timeLimit > xTaskGetTickCount()
-        && xSemaphoreTake(params->xUnitsCountingSemaphore, params->message.timeLimit - xTaskGetTickCount()) == pdPASS) {
-        if(xQueueSend(params->unitQueue, &params->message, 0) != pdPASS) {
-            logMsgSend(logQueue, LOG_ERROR, pcTaskGetName(NULL), "Failed to send the message to the original unit");
-            xSemaphoreGive(params->xUnitsCountingSemaphore);
+        else if(xSemaphoreTake(params->xAuxUnitsCountingSemaphore[1], 0) == pdPASS)
+        {
+            if(xQueueSend(params->auxUnitQueue[1], &params->message, 0) != pdPASS) {
+                sprintf(logMsg, "Failed to send the message to the spare unit %s", params->auxUnitName[1]);
+                logMsgSend(logQueue, LOG_ERROR, pcTaskGetName(NULL), logMsg);
+                xSemaphoreGive(params->xAuxUnitsCountingSemaphore[1]);
+                xQueueSend(faultManagementQueue, &params->message, 0);
+            }
+            else
+            {
+                sprintf(logMsg, "Sent the message to the spare unit %s", params->auxUnitName[1]);
+                logMsgSend(logQueue, LOG_INFO, pcTaskGetName(NULL), logMsg);
+            }
         }
-    } else {
-        sprintf(logMsg, "No available units for %s event", EmergencyType2string(params->message.emergencyType));
-        logMsgSend(logQueue, LOG_WARNING, pcTaskGetName(NULL), logMsg);
+        else if(params->message.timeLimit > xTaskGetTickCount()
+            && xSemaphoreTake(params->xUnitsCountingSemaphore, params->message.timeLimit - xTaskGetTickCount()) == pdPASS) {
+            if(xQueueSend(params->unitQueue, &params->message, 0) != pdPASS) {
+                logMsgSend(logQueue, LOG_ERROR, pcTaskGetName(NULL), "Failed to send the message to the original unit");
+                xSemaphoreGive(params->xUnitsCountingSemaphore);
+                xQueueSend(faultManagementQueue, &params->message, 0);
+            }
+        } else {
+            sprintf(logMsg, "No available units for %s event", EmergencyType2string(params->message.emergencyType));
+            logMsgSend(logQueue, LOG_WARNING, pcTaskGetName(NULL), logMsg);
+            xQueueSend(faultManagementQueue, &params->message, 0);
+        }
     }
     vPortFree(params);
     vTaskDelete(NULL);
+}
+
+void vFaultManagementTask(void *pvParameters)
+{
+    char logMsg[256];
+    Message_t message;
+    for (;;) {
+        if (xQueueReceive(faultManagementQueue, &message, portMAX_DELAY) == pdPASS) {
+            
+            if (message.emergencyType == POLICE) {
+                sprintf(logMsg, "The %s event for %s wasn't complete, sending Ben Gvir", EmergencyType2string(message.emergencyType), pcTaskGetName(message.taskHandle));
+                logMsgSend(logQueue, LOG_INFO, pcTaskGetName(NULL), logMsg);
+            } else if (message.emergencyType == AMBULANCE) {
+                sprintf(logMsg, "The %s event for %s wasn't complete, sending Kadisha team", EmergencyType2string(message.emergencyType), pcTaskGetName(message.taskHandle));
+                logMsgSend(logQueue, LOG_INFO, pcTaskGetName(NULL), logMsg);
+            } else if (message.emergencyType == FIRE) {
+                sprintf(logMsg, "The %s event for %s wasn't complete, sending Barbecue team", EmergencyType2string(message.emergencyType), pcTaskGetName(message.taskHandle));
+                logMsgSend(logQueue, LOG_INFO, pcTaskGetName(NULL), logMsg);
+            }
+        }
+    }
 }
 
 /* Timer callback function */
