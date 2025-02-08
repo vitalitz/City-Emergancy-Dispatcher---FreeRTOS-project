@@ -1,7 +1,6 @@
 .sconsign.dblite
 build/
+.vscode/
 src/FreeRTOS
 src/FreeRTOS-Plus
 Trace.dump
-.vscode/settings.json
-FreeRTOS-simulator-for-Linux.url
